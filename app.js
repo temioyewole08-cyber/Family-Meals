@@ -118,19 +118,165 @@ function loadBatches() {
 function saveBatches() { localStorage.setItem("fm.batches", JSON.stringify(state.batches)); }
 
 // =============================================================================
-// Per-week accessors (auto-seeded)
+// Per-week accessors (auto-seeded with rotation)
 // =============================================================================
 function currentPlan() {
   if (!state.plans[state.weekStart]) {
-    // Seed: clone latest earlier week if any, else default template
-    const earlier = Object.keys(state.plans).filter(k => k < state.weekStart).sort().pop();
-    state.plans[state.weekStart] = earlier
-      ? structuredClone(state.plans[earlier])
-      : structuredClone(DEFAULT_PLAN);
+    // First-ever week → use the curated default. Subsequent new weeks → auto-generate variety.
+    state.plans[state.weekStart] = (Object.keys(state.plans).length === 0)
+      ? structuredClone(DEFAULT_PLAN)
+      : generateWeek(state.weekStart);
     savePlans();
   }
   return state.plans[state.weekStart];
 }
+// -------- Auto-rotation engine --------
+function seededRandom(seed) {
+  return function() {
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = seed;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function seedFromString(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+function shuffle(arr, rand) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function pickN(arr, n, rand) { return shuffle(arr, rand).slice(0, n); }
+
+function collectRecentMeals(beforeWk, lookback) {
+  const keys = Object.keys(state.plans).filter(k => k < beforeWk).sort().slice(-lookback);
+  const out = { soup:new Set(), bAdult:new Set(), bKid:new Set(), kLunch:new Set(), aLunch:new Set() };
+  for (const k of keys) {
+    const p = state.plans[k];
+    for (const day of DAYS) {
+      const dp = p[day]; if (!dp) continue;
+      for (const slot of ["breakfast","lunch","dinner"]) {
+        const e = dp[slot]; if (!e) continue;
+        for (const id of [e.adultMealId, e.kidMealId, e.adultSideId, e.kidSideId]) {
+          if (!id) continue;
+          const m = getMeal(id); if (!m) continue;
+          if (m.category === "soup")            out.soup.add(id);
+          if (m.category === "breakfast-adult") out.bAdult.add(id);
+          if (m.category === "breakfast-kid")   out.bKid.add(id);
+          if (m.category === "kids-lunch")      out.kLunch.add(id);
+          if (m.category === "lunch-adult")     out.aLunch.add(id);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function preferUnused(pool, recentSet, minNeeded) {
+  const fresh = pool.filter(m => !recentSet.has(m.id));
+  return fresh.length >= minNeeded ? fresh : pool;
+}
+
+// Build a varied week from the vault. Deterministic per weekKey unless `shuffle:true`.
+function generateWeek(wk, opts = {}) {
+  const seed = opts.shuffle ? Date.now() : seedFromString(wk);
+  const rand = seededRandom(seed);
+  const recent = collectRecentMeals(wk, 4);
+
+  const byCat = c => state.meals.filter(m => m.category === c);
+
+  // 3 soups, prefer not used in last 4 weeks
+  const soups = pickN(preferUnused(byCat("soup"), recent.soup, 3), 3, rand);
+  if (soups.length < 3) return structuredClone(DEFAULT_PLAN);
+
+  // For each soup pick 2 different carbs from swallow pool
+  const swallows = byCat("swallow");
+  const carbPairs = soups.map(() => pickN(swallows, Math.min(2, swallows.length), rand));
+
+  // Adult breakfasts: pick 2 distinct (Stephen-friendly preferred for one slot)
+  const adultBfasts = pickN(preferUnused(byCat("breakfast-adult"), recent.bAdult, 2), 2, rand);
+  while (adultBfasts.length < 2) adultBfasts.push(adultBfasts[0]);
+
+  // Kid breakfasts: 2 distinct
+  const kidBfasts = pickN(preferUnused(byCat("breakfast-kid"), recent.bKid, 2), 2, rand);
+  while (kidBfasts.length < 2) kidBfasts.push(kidBfasts[0]);
+
+  // Adult weekday lunches: 5
+  const aLunchPool = preferUnused(byCat("lunch-adult"), recent.aLunch, 3);
+  const aLunches = [];
+  for (let i = 0; i < 5; i++) aLunches.push(aLunchPool[Math.floor(rand() * aLunchPool.length)]);
+
+  // Kids school lunches: 5 distinct, school-safe (no nuts)
+  const slPool0 = byCat("kids-lunch").filter(m => !m.nutAlert);
+  const slPool = preferUnused(slPool0, recent.kLunch, 5);
+  let kLunches = pickN(slPool, 5, rand);
+  if (kLunches.length < 5) kLunches = pickN(slPool0, 5, rand);
+
+  // Saturday flex: pick a protein meal + a swallow
+  const protein = pickN(byCat("protein"), 1, rand)[0];
+  const satCarb = pickN(swallows, 1, rand)[0];
+
+  // Sunday & Saturday family lunch: a rice meal
+  const riceFam = pickN(byCat("rice"), 2, rand);
+  const sunLunch = riceFam[0];
+  const satLunch = riceFam[1] || riceFam[0];
+
+  const fam = mealId => ({ type:"family", adultMealId:mealId, kidMealId:mealId });
+  const split = (a, k) => ({ type:"split", adultMealId:a, kidMealId:k });
+  const dinnerEntry = (soupIdx, dayIdx, fresh) => {
+    const s = soups[soupIdx], c = carbPairs[soupIdx][dayIdx];
+    return { type:"family", adultMealId:s.id, kidMealId:s.id,
+             adultSideId:c.id, kidSideId:c.id,
+             freshCook: fresh, repeat: !fresh, soupKey: s.id };
+  };
+
+  return {
+    Sun: {
+      breakfast: fam(adultBfasts[0].id),
+      lunch:     fam(sunLunch.id),
+      dinner:    dinnerEntry(0, 0, true),
+    },
+    Mon: {
+      breakfast: split(adultBfasts[1].id, kidBfasts[0].id),
+      lunch:     split(aLunches[0].id, kLunches[0].id),
+      dinner:    dinnerEntry(1, 0, true),
+    },
+    Tue: {
+      breakfast: split(adultBfasts[0].id, kidBfasts[1].id),
+      lunch:     split(aLunches[1].id, kLunches[1].id),
+      dinner:    dinnerEntry(2, 0, true),
+    },
+    Wed: {
+      breakfast: split(adultBfasts[1].id, kidBfasts[0].id),
+      lunch:     split(aLunches[2].id, kLunches[2].id),
+      dinner:    dinnerEntry(0, 1, false),
+    },
+    Thu: {
+      breakfast: split(adultBfasts[0].id, kidBfasts[1].id),
+      lunch:     split(aLunches[3].id, kLunches[3].id),
+      dinner:    dinnerEntry(1, 1, false),
+    },
+    Fri: {
+      breakfast: split(adultBfasts[1].id, kidBfasts[0].id),
+      lunch:     split(aLunches[4].id, kLunches[4].id),
+      dinner:    dinnerEntry(2, 1, false),
+    },
+    Sat: {
+      breakfast: fam(adultBfasts[0].id),
+      lunch:     fam(satLunch.id),
+      dinner:    { type:"family", adultMealId:protein.id, kidMealId:protein.id,
+                   adultSideId:satCarb.id, kidSideId:satCarb.id, flex:true },
+    },
+  };
+}
+
 function currentGrocery() {
   if (!state.groceries[state.weekStart]) state.groceries[state.weekStart] = {};
   return state.groceries[state.weekStart];
@@ -209,7 +355,8 @@ function renderPlanner() {
         </div>
         <button id="wk-next" title="Next week">›</button>
         ${!isThisWeek ? `<button id="wk-today">Jump to today</button>` : ""}
-        <button id="wk-clone" class="ghost" title="Replace this week with a fresh copy of the default template">Reset week</button>
+        <button id="wk-shuffle" class="primary" title="Re-roll this week from the recipe vault">🎲 Shuffle week</button>
+        <button id="wk-clone" class="ghost" title="Replace this week with the original default template">Reset to template</button>
       </div>
       <div class="legend">
         <span><span class="dot family"></span>Family shares</span>
@@ -504,10 +651,14 @@ function bindPlanner() {
   document.getElementById("wk-today")?.addEventListener("click", () => {
     state.weekStart = weekKey(new Date()); render();
   });
+  document.getElementById("wk-shuffle")?.addEventListener("click", () => {
+    state.plans[state.weekStart] = generateWeek(state.weekStart, { shuffle: true });
+    savePlans(); render(); toast("Fresh meals shuffled in 🎲");
+  });
   document.getElementById("wk-clone")?.addEventListener("click", () => {
-    if (!confirm("Replace this week with a fresh copy of the default template? Tick state stays.")) return;
+    if (!confirm("Replace this week with the original default template?")) return;
     state.plans[state.weekStart] = structuredClone(DEFAULT_PLAN);
-    savePlans(); render(); toast("Week reset");
+    savePlans(); render(); toast("Week reset to template");
   });
 }
 
