@@ -1,5 +1,5 @@
 /* ---------------------------------------------------------
-   Family Meals — app logic (vanilla JS, no build step)
+   Family Meals — app logic (Paprika-style, multi-week)
    --------------------------------------------------------- */
 
 const DAYS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
@@ -13,58 +13,138 @@ const BENEFIT_LABELS = {
   "anti-inflammatory": { klass: "anti", text: "Anti-inflam" },
 };
 
-// ---------- State ----------
+const CATEGORY_EMOJI = {
+  "soup":            "🍲",
+  "rice":            "🍚",
+  "swallow":         "🍡",
+  "protein":         "🍗",
+  "breakfast-adult": "🍳",
+  "breakfast-kid":   "🥞",
+  "kids-lunch":      "🥪",
+  "lunch-adult":     "🥗",
+};
+
+// =============================================================================
+// Date / week helpers
+// =============================================================================
+function startOfWeek(d) {
+  const x = new Date(d); x.setHours(0,0,0,0);
+  x.setDate(x.getDate() - x.getDay()); // back to Sunday
+  return x;
+}
+function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate()+n); return x; }
+function weekKey(d) { return startOfWeek(d).toISOString().slice(0,10); }
+function fmtDate(d, opts={month:"short",day:"numeric"}) { return d.toLocaleDateString(undefined, opts); }
+function fmtDateLong(d) { return d.toLocaleDateString(undefined, { weekday:"long", month:"long", day:"numeric", year:"numeric" }); }
+
+// =============================================================================
+// State + persistence
+// =============================================================================
 const state = {
   view: "planner",
   meals: loadMeals(),
-  plan: loadPlan(),
-  grocery: loadGrocery(),   // { itemKey: checked }
-  batch:   loadBatch(),     // { taskId: done }
+  plans:    loadPlans(),    // { weekKey: { Sun: {...}, ... } }
+  groceries: loadGroceries(),// { weekKey: { itemKey: true } }
+  batches:   loadBatches(), // { weekKey: { taskId: true } }
+  weekStart: weekKey(new Date()), // current viewed week
   vaultFilter: { search: "", category: "all", stephenOnly: false },
   swap: null,
+  recipeDetailId: null,
 };
 
-// ---------- Persistence ----------
 function loadMeals() {
   const saved = localStorage.getItem("fm.meals");
-  if (saved) { try { return JSON.parse(saved); } catch {} }
-  return structuredClone(DEFAULT_MEALS);
+  let arr;
+  if (saved) { try { arr = JSON.parse(saved); } catch {} }
+  if (!arr) arr = structuredClone(DEFAULT_MEALS);
+  // Backfill new fields on existing data
+  for (const m of arr) {
+    if (!m.image) m.image = CATEGORY_EMOJI[m.category] || "🍽";
+    if (m.servings == null) m.servings = m.category === "kids-lunch" ? 3 : 5;
+    if (m.instructions == null) m.instructions = "";
+  }
+  return arr;
 }
 function saveMeals() { localStorage.setItem("fm.meals", JSON.stringify(state.meals)); }
 
-function loadPlan() {
-  const saved = localStorage.getItem("fm.plan");
+function loadPlans() {
+  const saved = localStorage.getItem("fm.plans");
   if (saved) { try { return JSON.parse(saved); } catch {} }
-  return structuredClone(DEFAULT_PLAN);
-}
-function savePlan() { localStorage.setItem("fm.plan", JSON.stringify(state.plan)); }
-
-function loadGrocery() {
-  // URL override first (shareable link)
-  const urlState = new URLSearchParams(location.search).get("g");
-  if (urlState) {
+  // Migrate from v1 single-plan storage
+  const oldPlan = localStorage.getItem("fm.plan");
+  if (oldPlan) {
     try {
-      const decoded = JSON.parse(atob(decodeURIComponent(urlState)));
-      localStorage.setItem("fm.grocery", JSON.stringify(decoded));
-      return decoded;
+      const obj = {};
+      obj[weekKey(new Date())] = JSON.parse(oldPlan);
+      localStorage.setItem("fm.plans", JSON.stringify(obj));
+      return obj;
     } catch {}
   }
-  const saved = localStorage.getItem("fm.grocery");
-  return saved ? JSON.parse(saved) : {};
+  return {};
 }
-function saveGrocery() { localStorage.setItem("fm.grocery", JSON.stringify(state.grocery)); }
+function savePlans() { localStorage.setItem("fm.plans", JSON.stringify(state.plans)); }
 
-function loadBatch() {
-  const saved = localStorage.getItem("fm.batch");
-  return saved ? JSON.parse(saved) : {};
+function loadGroceries() {
+  const urlState = new URLSearchParams(location.search).get("g");
+  const urlWeek  = new URLSearchParams(location.search).get("gw");
+  const saved = localStorage.getItem("fm.groceries");
+  let map = {};
+  if (saved) { try { map = JSON.parse(saved); } catch {} }
+  else {
+    // migrate
+    const oldG = localStorage.getItem("fm.grocery");
+    if (oldG) try { map[weekKey(new Date())] = JSON.parse(oldG); } catch {}
+  }
+  if (urlState && urlWeek) {
+    try {
+      const decoded = JSON.parse(atob(decodeURIComponent(urlState)));
+      map[urlWeek] = decoded;
+      localStorage.setItem("fm.groceries", JSON.stringify(map));
+    } catch {}
+  }
+  return map;
 }
-function saveBatch() { localStorage.setItem("fm.batch", JSON.stringify(state.batch)); }
+function saveGroceries() { localStorage.setItem("fm.groceries", JSON.stringify(state.groceries)); }
 
-// ---------- Helpers ----------
+function loadBatches() {
+  const saved = localStorage.getItem("fm.batches");
+  if (saved) { try { return JSON.parse(saved); } catch {} }
+  const oldB = localStorage.getItem("fm.batch");
+  if (oldB) {
+    try { const o = {}; o[weekKey(new Date())] = JSON.parse(oldB); return o; } catch {}
+  }
+  return {};
+}
+function saveBatches() { localStorage.setItem("fm.batches", JSON.stringify(state.batches)); }
+
+// =============================================================================
+// Per-week accessors (auto-seeded)
+// =============================================================================
+function currentPlan() {
+  if (!state.plans[state.weekStart]) {
+    // Seed: clone latest earlier week if any, else default template
+    const earlier = Object.keys(state.plans).filter(k => k < state.weekStart).sort().pop();
+    state.plans[state.weekStart] = earlier
+      ? structuredClone(state.plans[earlier])
+      : structuredClone(DEFAULT_PLAN);
+    savePlans();
+  }
+  return state.plans[state.weekStart];
+}
+function currentGrocery() {
+  if (!state.groceries[state.weekStart]) state.groceries[state.weekStart] = {};
+  return state.groceries[state.weekStart];
+}
+function currentBatch() {
+  if (!state.batches[state.weekStart]) state.batches[state.weekStart] = {};
+  return state.batches[state.weekStart];
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
 const getMeal = id => state.meals.find(m => m.id === id);
-const mealsByCat = cat => state.meals.filter(m => m.category === cat);
-
-function isSchoolDay(day) { return SCHOOL_DAYS.includes(day); }
+const isSchoolDay = day => SCHOOL_DAYS.includes(day);
 
 function badgesFor(meal, ctx = {}) {
   const out = [];
@@ -84,7 +164,13 @@ function toast(msg) {
   toast._tm = setTimeout(() => t.classList.add("hidden"), 2200);
 }
 
-// ---------- View switch ----------
+function escapeHtml(s) {
+  return (s||"").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// =============================================================================
+// View switch
+// =============================================================================
 document.getElementById("tabs").addEventListener("click", e => {
   const btn = e.target.closest("button[data-view]");
   if (!btn) return;
@@ -103,14 +189,27 @@ function render() {
 }
 
 // =============================================================================
-// PLANNER
+// PLANNER (with week navigation)
 // =============================================================================
 function renderPlanner() {
+  const sun = startOfWeek(new Date(state.weekStart + "T00:00:00"));
+  const sat = addDays(sun, 6);
+  const todayKey = weekKey(new Date());
+  const isThisWeek = state.weekStart === todayKey;
+
+  const plan = currentPlan();
+
   return `
     <div class="planner-toolbar">
-      <div>
-        <h2>Week of ${weekOfLabel()}</h2>
-        <p class="muted">Sunday → Saturday · tap any meal to swap it</p>
+      <div class="week-nav">
+        <button id="wk-prev" title="Previous week">‹</button>
+        <div class="week-label">
+          <h2>${fmtDate(sun)} – ${fmtDate(sat, {month:"short",day:"numeric",year:"numeric"})}</h2>
+          <p class="muted">${isThisWeek ? "This week" : (state.weekStart < todayKey ? "Past week" : "Upcoming week")} · tap any meal to swap</p>
+        </div>
+        <button id="wk-next" title="Next week">›</button>
+        ${!isThisWeek ? `<button id="wk-today">Jump to today</button>` : ""}
+        <button id="wk-clone" class="ghost" title="Replace this week with a fresh copy of the default template">Reset week</button>
       </div>
       <div class="legend">
         <span><span class="dot family"></span>Family shares</span>
@@ -120,27 +219,23 @@ function renderPlanner() {
       </div>
     </div>
     <div class="week-grid">
-      ${DAYS.map(renderDay).join("")}
+      ${DAYS.map((d, i) => renderDay(d, addDays(sun, i), plan)).join("")}
     </div>
   `;
 }
 
-function weekOfLabel() {
-  const d = new Date();
-  const sun = new Date(d); sun.setDate(d.getDate() - d.getDay());
-  const sat = new Date(sun); sat.setDate(sun.getDate()+6);
-  const opts = { month: "short", day: "numeric" };
-  return `${sun.toLocaleDateString(undefined, opts)} – ${sat.toLocaleDateString(undefined, opts)}`;
-}
-
-function renderDay(day) {
-  const p = state.plan[day];
+function renderDay(day, dateObj, plan) {
+  const p = plan[day] || {};
   const tag = day === "Sat" ? "✨ flex cook"
             : day === "Sun" ? "🔥 batch cook"
             : isSchoolDay(day) ? "school day" : "";
+  const dateLabel = `${dateObj.getMonth()+1}/${dateObj.getDate()}`;
   return `
     <div class="day">
-      <div class="day-head"><h3>${DAY_FULL[day]}</h3><span class="tag">${tag}</span></div>
+      <div class="day-head">
+        <h3>${DAY_FULL[day]} <span class="day-num">${dateLabel}</span></h3>
+        <span class="tag">${tag}</span>
+      </div>
       ${renderSlot(day, "breakfast", p.breakfast)}
       ${renderSlot(day, "lunch",     p.lunch)}
       ${renderSlot(day, "dinner",    p.dinner)}
@@ -149,18 +244,16 @@ function renderDay(day) {
 }
 
 function renderSlot(day, slot, entry) {
-  if (!entry) return "";
-  if (entry.type === "family") {
-    return slotCard({
-      klass: "family",
-      slot, day,
-      side: "family",
-      mealId: entry.adultMealId,
-      sideId: entry.adultSideId,
-      entry,
-    });
+  if (!entry) {
+    return `<div class="card empty" data-day="${day}" data-slot="${slot}" data-side="family">
+              <div class="slot-label">${slot}</div>
+              <div class="empty-text">+ tap to add</div>
+            </div>`;
   }
-  // split
+  if (entry.type === "family") {
+    return slotCard({ klass: "family", slot, day, side: "family",
+      mealId: entry.adultMealId, sideId: entry.adultSideId, entry });
+  }
   return `<div class="split-card">
     ${slotCard({ klass: "adults", slot, day, side: "adult",
       mealId: entry.adultMealId, sideId: entry.adultSideId, entry })}
@@ -184,27 +277,23 @@ function slotCard({ klass, slot, day, side, mealId, sideId, entry }) {
   const kidCal   = (meal.caloriesKid || 0)   + (sideMeal ? sideMeal.caloriesKid   : 0);
 
   let calLine;
-  if (klass === "family") {
-    calLine = `<span>Adults <b>${adultCal}</b> cal</span><span>Kids <b>${kidCal}</b> cal</span>`;
-  } else if (klass === "adults") {
-    calLine = `<span>Adult <b>${adultCal}</b> cal</span>`;
-  } else {
-    calLine = `<span>Kid <b>${kidCal}</b> cal</span>`;
-  }
+  if (klass === "family")     calLine = `<span>Adults <b>${adultCal}</b></span><span>Kids <b>${kidCal}</b></span>`;
+  else if (klass === "adults")calLine = `<span>Adult <b>${adultCal}</b> cal</span>`;
+  else                         calLine = `<span>Kid <b>${kidCal}</b> cal</span>`;
 
-  const subline = sideMeal
-    ? `with <b>${sideMeal.name}</b>`
-    : meal.notes ? meal.notes : "";
-
+  const subline = sideMeal ? `with <b>${sideMeal.name}</b>` : (meal.notes || "");
   const slotLabel = side === "adult" ? `Adult · ${slot}`
-                 : side === "kid"   ? `Kid · ${slot}`
-                 : slot;
+                  : side === "kid"   ? `Kid · ${slot}` : slot;
 
   return `
-    <div class="card ${klass}"
-         data-day="${day}" data-slot="${slot}" data-side="${side}">
-      <div class="slot-label">${slotLabel}${nutContext && meal.nutAlert ? " · ⚠ NUT" : ""}</div>
-      <div class="meal-name">${meal.name}</div>
+    <div class="card ${klass}" data-day="${day}" data-slot="${slot}" data-side="${side}">
+      <div class="card-top">
+        <div class="card-img">${meal.image || CATEGORY_EMOJI[meal.category] || "🍽"}</div>
+        <div class="card-info">
+          <div class="slot-label">${slotLabel}${nutContext && meal.nutAlert ? " · ⚠ NUT" : ""}</div>
+          <div class="meal-name">${meal.name}</div>
+        </div>
+      </div>
       ${subline ? `<div class="sub-line">${subline}</div>` : ""}
       <div class="cal-row">${calLine}</div>
       ${badges.length ? `<div class="badges">${badges.map(b => `<span class="badge ${b.klass}">${b.text}</span>`).join("")}</div>` : ""}
@@ -213,13 +302,13 @@ function slotCard({ klass, slot, day, side, mealId, sideId, entry }) {
 }
 
 // =============================================================================
-// GROCERY
+// GROCERY (per-week)
 // =============================================================================
 function buildGrocery() {
-  // Aggregate unique (item, section) across the full week plan
-  const set = new Map(); // key = item|section
+  const plan = currentPlan();
+  const set = new Map();
   for (const day of DAYS) {
-    const p = state.plan[day];
+    const p = plan[day] || {};
     for (const slot of ["breakfast","lunch","dinner"]) {
       const entry = p[slot];
       if (!entry) continue;
@@ -250,6 +339,7 @@ function buildGrocery() {
 
 function renderGrocery() {
   const { bySection, sectionOrder } = buildGrocery();
+  const grocery = currentGrocery();
   let total = 0, done = 0;
   const sections = sectionOrder.map(sec => {
     const items = bySection[sec] || [];
@@ -257,7 +347,7 @@ function renderGrocery() {
     const itemsHtml = items.map(name => {
       const key = `${sec}::${name}`;
       total++;
-      const checked = !!state.grocery[key];
+      const checked = !!grocery[key];
       if (checked) done++;
       return `
         <label class="grocery-item ${checked ? "done" : ""}">
@@ -266,16 +356,16 @@ function renderGrocery() {
         </label>
       `;
     }).join("");
-    return `
-      <div class="grocery-section">
-        <h3>${sec}</h3>
-        <div class="grocery-items">${itemsHtml}</div>
-      </div>
-    `;
+    return `<div class="grocery-section"><h3>${sec}</h3><div class="grocery-items">${itemsHtml}</div></div>`;
   }).join("");
+
+  const sun = startOfWeek(new Date(state.weekStart + "T00:00:00"));
+  const sat = addDays(sun, 6);
 
   return `
     <div class="grocery-toolbar">
+      <h2>Grocery list — ${fmtDate(sun)} – ${fmtDate(sat)}</h2>
+      <span class="spacer"></span>
       <button id="gr-copy" class="primary">📋 Copy unchecked</button>
       <button id="gr-share">🔗 Shareable link</button>
       <button id="gr-reset" class="ghost">Reset ticks</button>
@@ -285,7 +375,7 @@ function renderGrocery() {
       <div>${sections}</div>
       <aside class="sticky-side">
         <h3>Share with Stephen</h3>
-        <p>Copy the link below — whoever opens it sees the same tick state. Update the link whenever the list changes.</p>
+        <p>Generates a link with this week's tick state baked in. Whoever opens it sees the same checks.</p>
         <button id="gr-make-link" class="primary">Generate link</button>
         <div id="gr-link-box"></div>
       </aside>
@@ -294,11 +384,12 @@ function renderGrocery() {
 }
 
 // =============================================================================
-// BATCH COOK
+// BATCH COOK (per-week)
 // =============================================================================
 function renderBatch() {
   const tasks = BATCH_TASKS;
-  const done = tasks.filter(t => state.batch[t.id]).length;
+  const batch = currentBatch();
+  const done = tasks.filter(t => batch[t.id]).length;
   const pct = Math.round((done / tasks.length) * 100);
 
   const byDay = {};
@@ -306,15 +397,16 @@ function renderBatch() {
 
   const dayBlocks = ["Saturday","Sunday"].map(day => {
     const list = byDay[day] || [];
-    return `
-      <h3 class="batch-day-head">${day} — ${list.length} task${list.length === 1 ? "" : "s"}</h3>
-      ${list.map(renderBatchTask).join("")}
-    `;
+    return `<h3 class="batch-day-head">${day} — ${list.length} task${list.length === 1 ? "" : "s"}</h3>
+            ${list.map(t => renderBatchTask(t, batch)).join("")}`;
   }).join("");
+
+  const sun = startOfWeek(new Date(state.weekStart + "T00:00:00"));
+  const sat = addDays(sun, 6);
 
   return `
     <div class="batch-toolbar">
-      <h2>Batch cook guide</h2>
+      <h2>Batch cook — ${fmtDate(sun)} – ${fmtDate(sat)}</h2>
       <div class="progress"><div style="width:${pct}%"></div></div>
       <span class="muted">${done}/${tasks.length} · ${pct}%</span>
       <button id="batch-reset" class="ghost">Reset</button>
@@ -323,17 +415,14 @@ function renderBatch() {
   `;
 }
 
-function renderBatchTask(t) {
-  const done = !!state.batch[t.id];
+function renderBatchTask(t, batch) {
+  const done = !!batch[t.id];
   return `
     <label class="batch-task ${done ? "done" : ""}">
       <input type="checkbox" data-task="${t.id}" ${done ? "checked" : ""}>
       <div style="flex:1">
         <div class="title">${t.title}</div>
-        <div class="meta">
-          <span>⏱ ${t.minutes} min</span>
-          <span>🍽 Feeds: ${t.feeds}</span>
-        </div>
+        <div class="meta"><span>⏱ ${t.minutes} min</span><span>🍽 Feeds: ${t.feeds}</span></div>
         <div class="storage">📦 ${t.storage}</div>
       </div>
     </label>
@@ -341,7 +430,7 @@ function renderBatchTask(t) {
 }
 
 // =============================================================================
-// VAULT
+// VAULT (Paprika-style cards)
 // =============================================================================
 function renderVault() {
   const { search, category, stephenOnly } = state.vaultFilter;
@@ -357,9 +446,9 @@ function renderVault() {
 
   return `
     <div class="vault-toolbar">
-      <h2>Meal vault <span class="muted">(${filtered.length})</span></h2>
+      <h2>Recipes <span class="muted">(${filtered.length})</span></h2>
       <span class="spacer"></span>
-      <input id="vault-search" placeholder="Search meals…" value="${escapeHtml(search)}">
+      <input id="vault-search" placeholder="Search recipes…" value="${escapeHtml(search)}">
       <select id="vault-cat">
         <option value="all">All categories</option>
         ${cats.map(c => `<option value="${c}" ${c===category?"selected":""}>${c}</option>`).join("")}
@@ -368,7 +457,7 @@ function renderVault() {
         <input type="checkbox" id="vault-stephen" style="width:auto" ${stephenOnly?"checked":""}>
         Stephen-friendly only
       </label>
-      <button id="vault-add" class="primary">+ Add meal</button>
+      <button id="vault-add" class="primary">+ Add recipe</button>
     </div>
     <div class="vault-grid">
       ${filtered.map(renderVaultCard).join("")}
@@ -379,27 +468,21 @@ function renderVault() {
 function renderVaultCard(m) {
   const badges = badgesFor(m, { nutAlertContext: true });
   return `
-    <div class="vault-card">
-      <div class="cat">${m.category} · ${m.cuisine}</div>
-      <div class="name">${m.name}</div>
-      <div class="calrow">Adult <b>${m.caloriesAdult}</b> · Kid <b>${m.caloriesKid}</b> cal · ⏱ ${m.prepTime}m</div>
-      <div class="tagrow">
-        ${m.kidsFriendly ? `<span class="pill">kids ok</span>` : ""}
-        ${m.stephenFriendly ? `<span class="pill">Stephen ok</span>` : ""}
-        <span class="pill">${m.proteinType}</span>
-        ${badges.map(b => `<span class="badge ${b.klass}">${b.text}</span>`).join("")}
-      </div>
-      ${m.notes ? `<div class="muted" style="font-size:12px">${escapeHtml(m.notes)}</div>` : ""}
-      <div class="actions">
-        <button data-edit="${m.id}">Edit</button>
-        <button class="danger" data-del="${m.id}">Delete</button>
+    <div class="vault-card" data-detail="${m.id}">
+      <div class="vault-img">${m.image || CATEGORY_EMOJI[m.category] || "🍽"}</div>
+      <div class="vault-body">
+        <div class="cat">${m.category} · ${m.cuisine}</div>
+        <div class="name">${m.name}</div>
+        <div class="calrow">A <b>${m.caloriesAdult}</b> · K <b>${m.caloriesKid}</b> · ⏱ ${m.prepTime}m · serves ${m.servings || 5}</div>
+        <div class="tagrow">
+          ${m.kidsFriendly ? `<span class="pill">kids</span>` : ""}
+          ${m.stephenFriendly ? `<span class="pill">Stephen</span>` : ""}
+          <span class="pill">${m.proteinType}</span>
+          ${badges.map(b => `<span class="badge ${b.klass}">${b.text}</span>`).join("")}
+        </div>
       </div>
     </div>
   `;
-}
-
-function escapeHtml(s) {
-  return (s||"").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
 // =============================================================================
@@ -416,64 +499,79 @@ function bindPlanner() {
   document.querySelectorAll(".card[data-day]").forEach(el => {
     el.addEventListener("click", () => openSwap(el.dataset.day, el.dataset.slot, el.dataset.side));
   });
+  document.getElementById("wk-prev")?.addEventListener("click", () => navWeek(-7));
+  document.getElementById("wk-next")?.addEventListener("click", () => navWeek(+7));
+  document.getElementById("wk-today")?.addEventListener("click", () => {
+    state.weekStart = weekKey(new Date()); render();
+  });
+  document.getElementById("wk-clone")?.addEventListener("click", () => {
+    if (!confirm("Replace this week with a fresh copy of the default template? Tick state stays.")) return;
+    state.plans[state.weekStart] = structuredClone(DEFAULT_PLAN);
+    savePlans(); render(); toast("Week reset");
+  });
+}
+
+function navWeek(deltaDays) {
+  const d = new Date(state.weekStart + "T00:00:00");
+  state.weekStart = weekKey(addDays(d, deltaDays));
+  render();
 }
 
 function bindGrocery() {
   document.querySelectorAll(".grocery-item input").forEach(cb => {
     cb.addEventListener("change", () => {
       const key = decodeURIComponent(cb.dataset.key);
-      if (cb.checked) state.grocery[key] = true;
-      else delete state.grocery[key];
-      saveGrocery();
+      const g = currentGrocery();
+      if (cb.checked) g[key] = true; else delete g[key];
+      saveGroceries();
       render();
     });
   });
   document.getElementById("gr-copy")?.addEventListener("click", () => {
     const { bySection, sectionOrder } = buildGrocery();
+    const g = currentGrocery();
     const lines = [];
     for (const sec of sectionOrder) {
-      const items = (bySection[sec] || []).filter(n => !state.grocery[`${sec}::${n}`]);
+      const items = (bySection[sec] || []).filter(n => !g[`${sec}::${n}`]);
       if (!items.length) continue;
       lines.push(sec.toUpperCase());
       items.forEach(i => lines.push(`  • ${i}`));
       lines.push("");
     }
-    const text = lines.join("\n");
-    navigator.clipboard.writeText(text).then(
+    navigator.clipboard.writeText(lines.join("\n")).then(
       () => toast("Unchecked items copied"),
       () => toast("Copy failed — try the share link")
     );
   });
   document.getElementById("gr-reset")?.addEventListener("click", () => {
-    state.grocery = {}; saveGrocery(); render();
+    state.groceries[state.weekStart] = {}; saveGroceries(); render();
   });
-  document.getElementById("gr-share")?.addEventListener("click", () => makeShareLink(true));
-  document.getElementById("gr-make-link")?.addEventListener("click", () => makeShareLink(false));
+  document.getElementById("gr-share")?.addEventListener("click", () => makeShareLink());
+  document.getElementById("gr-make-link")?.addEventListener("click", () => makeShareLink());
 }
 
-function makeShareLink(copyToo) {
-  const encoded = btoa(JSON.stringify(state.grocery));
-  const url = `${location.origin}${location.pathname}?view=grocery&g=${encodeURIComponent(encoded)}`;
+function makeShareLink() {
+  const encoded = btoa(JSON.stringify(currentGrocery()));
+  const url = `${location.origin}${location.pathname}?view=grocery&gw=${state.weekStart}&g=${encodeURIComponent(encoded)}`;
   const box = document.getElementById("gr-link-box");
   if (box) box.innerHTML = `<span class="share-link">${url}</span>`;
-  if (copyToo || true) {
-    navigator.clipboard.writeText(url).then(
-      () => toast("Share link copied"),
-      () => toast("Link generated (copy manually)")
-    );
-  }
+  navigator.clipboard.writeText(url).then(
+    () => toast("Share link copied"),
+    () => toast("Link generated (copy manually)")
+  );
 }
 
 function bindBatch() {
   document.querySelectorAll("[data-task]").forEach(cb => {
     cb.addEventListener("change", () => {
       const id = cb.dataset.task;
-      if (cb.checked) state.batch[id] = true; else delete state.batch[id];
-      saveBatch(); render();
+      const b = currentBatch();
+      if (cb.checked) b[id] = true; else delete b[id];
+      saveBatches(); render();
     });
   });
   document.getElementById("batch-reset")?.addEventListener("click", () => {
-    state.batch = {}; saveBatch(); render();
+    state.batches[state.weekStart] = {}; saveBatches(); render();
   });
 }
 
@@ -489,21 +587,12 @@ function bindVault() {
     state.vaultFilter.stephenOnly = e.target.checked; renderVaultGridOnly();
   });
   document.getElementById("vault-add").addEventListener("click", () => openMealEditor(null));
-  document.querySelectorAll("[data-edit]").forEach(b => b.addEventListener("click", () => openMealEditor(b.dataset.edit)));
-  document.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", () => {
-    const id = b.dataset.del;
-    const meal = getMeal(id);
-    if (!meal) return;
-    if (!confirm(`Delete "${meal.name}" from the vault?`)) return;
-    state.meals = state.meals.filter(m => m.id !== id);
-    saveMeals();
-    toast(`Deleted ${meal.name}`);
-    render();
-  }));
+  document.querySelectorAll("[data-detail]").forEach(c => {
+    c.addEventListener("click", () => openRecipeDetail(c.dataset.detail));
+  });
 }
 
 function renderVaultGridOnly() {
-  // Re-render just the grid for responsiveness
   const { search, category, stephenOnly } = state.vaultFilter;
   const s = search.toLowerCase();
   const filtered = state.meals.filter(m => {
@@ -514,12 +603,180 @@ function renderVaultGridOnly() {
   });
   document.querySelector(".vault-grid").innerHTML = filtered.map(renderVaultCard).join("");
   document.querySelector(".vault-toolbar .muted").textContent = `(${filtered.length})`;
-  document.querySelectorAll("[data-edit]").forEach(b => b.addEventListener("click", () => openMealEditor(b.dataset.edit)));
-  document.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", () => {
-    const id = b.dataset.del;
-    if (!confirm(`Delete "${getMeal(id).name}" from the vault?`)) return;
-    state.meals = state.meals.filter(m => m.id !== id); saveMeals(); render();
-  }));
+  document.querySelectorAll("[data-detail]").forEach(c => {
+    c.addEventListener("click", () => openRecipeDetail(c.dataset.detail));
+  });
+}
+
+// =============================================================================
+// RECIPE DETAIL (Paprika-style)
+// =============================================================================
+function openRecipeDetail(id) {
+  const m = getMeal(id);
+  if (!m) return;
+  state.recipeDetailId = id;
+
+  const ingredients = MEAL_INGREDIENTS[id] || [];
+  const ingBySection = {};
+  for (const [name, section] of ingredients) (ingBySection[section] ||= []).push(name);
+
+  const badges = badgesFor(m, { nutAlertContext: true });
+
+  document.getElementById("recipe-modal").innerHTML = `
+    <div class="recipe-inner">
+      <button class="icon-btn recipe-close" id="recipe-close" aria-label="Close">✕</button>
+      <div class="recipe-hero">
+        <div class="recipe-img">${m.image || CATEGORY_EMOJI[m.category] || "🍽"}</div>
+        <div class="recipe-meta">
+          <div class="cat">${m.category} · ${m.cuisine}</div>
+          <h1>${m.name}</h1>
+          <div class="recipe-stats">
+            <span>⏱ <b>${m.prepTime}</b> min</span>
+            <span>🍽 Serves <b>${m.servings || 5}</b></span>
+            <span>Adult <b>${m.caloriesAdult}</b> cal</span>
+            <span>Kid <b>${m.caloriesKid}</b> cal</span>
+          </div>
+          <div class="tagrow">
+            ${m.kidsFriendly ? `<span class="pill">kids ok</span>` : ""}
+            ${m.stephenFriendly ? `<span class="pill">Stephen ok</span>` : ""}
+            <span class="pill">${m.proteinType}</span>
+            ${badges.map(b => `<span class="badge ${b.klass}">${b.text}</span>`).join("")}
+          </div>
+          ${m.notes ? `<p class="muted">${escapeHtml(m.notes)}</p>` : ""}
+          <div class="recipe-actions">
+            <button id="recipe-schedule" class="primary">📅 Schedule on plan</button>
+            <button id="recipe-edit">✏️ Edit recipe</button>
+            <button id="recipe-delete" class="danger">Delete</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="recipe-body">
+        <section>
+          <h2>Ingredients</h2>
+          ${Object.keys(ingBySection).length === 0
+            ? `<p class="muted">No ingredients listed yet — edit the recipe to add some.</p>`
+            : Object.entries(ingBySection).map(([sec, items]) => `
+              <h4>${sec}</h4>
+              <ul class="ing-list">${items.map(n => `<li>${n}</li>`).join("")}</ul>
+            `).join("")}
+        </section>
+        <section>
+          <h2>Directions</h2>
+          ${m.instructions
+            ? `<div class="directions">${escapeHtml(m.instructions).split(/\n+/).map((p,i) => `<p><span class="step-num">${i+1}</span>${p}</p>`).join("")}</div>`
+            : `<p class="muted">No directions yet — click <b>Edit recipe</b> to add cooking steps.</p>`}
+        </section>
+      </div>
+    </div>
+  `;
+  document.getElementById("recipe-modal").classList.remove("hidden");
+  document.getElementById("recipe-close").onclick = closeRecipe;
+  document.getElementById("recipe-edit").onclick = () => { closeRecipe(); openMealEditor(id); };
+  document.getElementById("recipe-delete").onclick = () => {
+    if (!confirm(`Delete "${m.name}" from the vault?`)) return;
+    state.meals = state.meals.filter(x => x.id !== id);
+    saveMeals();
+    closeRecipe();
+    toast(`Deleted ${m.name}`);
+    render();
+  };
+  document.getElementById("recipe-schedule").onclick = () => openScheduler(id);
+}
+
+function closeRecipe() {
+  document.getElementById("recipe-modal").classList.add("hidden");
+  state.recipeDetailId = null;
+}
+document.getElementById("recipe-modal").addEventListener("click", e => {
+  if (e.target.id === "recipe-modal") closeRecipe();
+});
+
+// =============================================================================
+// SCHEDULER (Schedule a recipe onto the plan)
+// =============================================================================
+function openScheduler(mealId) {
+  const meal = getMeal(mealId);
+  if (!meal) return;
+  // Build next-14-day options
+  const today = new Date(); today.setHours(0,0,0,0);
+  const opts = [];
+  for (let i = 0; i < 21; i++) {
+    const d = addDays(today, i);
+    const dayKey = DAYS[d.getDay()];
+    opts.push({
+      iso: d.toISOString().slice(0,10),
+      wk:  weekKey(d),
+      dayKey,
+      label: `${DAY_FULL[dayKey]}, ${fmtDate(d, {month:"short", day:"numeric"})}`
+    });
+  }
+  const slotChoices = (meal.category === "breakfast-adult" || meal.category === "breakfast-kid")
+    ? ["breakfast"]
+    : meal.category === "kids-lunch" || meal.category === "lunch-adult"
+      ? ["lunch"]
+      : ["breakfast","lunch","dinner"];
+  const sideChoices = (meal.category === "kids-lunch" || meal.category === "breakfast-kid") ? ["kid"]
+                    : (meal.category === "lunch-adult" || meal.category === "breakfast-adult") ? ["adult"]
+                    : ["family","adult","kid"];
+
+  const body = document.getElementById("modal-body");
+  document.getElementById("modal-title").textContent = `Schedule: ${meal.name}`;
+  body.innerHTML = `
+    <div class="form-grid">
+      <div class="full"><label>Day</label>
+        <select id="sch-day">${opts.map(o => `<option value="${o.iso}|${o.wk}|${o.dayKey}">${o.label}</option>`).join("")}</select>
+      </div>
+      <div><label>Slot</label>
+        <select id="sch-slot">${slotChoices.map(s => `<option>${s}</option>`).join("")}</select>
+      </div>
+      <div><label>Who</label>
+        <select id="sch-side">${sideChoices.map(s => `<option value="${s}">${s === "family" ? "Whole family" : s === "adult" ? "Adults only" : "Kids only"}</option>`).join("")}</select>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button id="sch-cancel">Cancel</button>
+      <button id="sch-save" class="primary">Schedule</button>
+    </div>
+  `;
+  document.getElementById("modal").classList.remove("hidden");
+
+  document.getElementById("sch-cancel").onclick = closeModal;
+  document.getElementById("sch-save").onclick = () => {
+    const [iso, wk, dayKey] = document.getElementById("sch-day").value.split("|");
+    const slot = document.getElementById("sch-slot").value;
+    const side = document.getElementById("sch-side").value;
+
+    if (!state.plans[wk]) {
+      const earlier = Object.keys(state.plans).filter(k => k < wk).sort().pop();
+      state.plans[wk] = earlier ? structuredClone(state.plans[earlier]) : structuredClone(DEFAULT_PLAN);
+    }
+    const dayPlan = (state.plans[wk][dayKey] ||= {});
+    const existing = dayPlan[slot] || {};
+    const next = { ...existing };
+    if (side === "family") {
+      next.type = "family";
+      next.adultMealId = mealId;
+      next.kidMealId   = mealId;
+    } else if (side === "adult") {
+      next.type = existing.kidMealId && existing.kidMealId !== mealId ? "split" : "family";
+      next.adultMealId = mealId;
+      if (!next.kidMealId) next.kidMealId = mealId;
+    } else { // kid
+      next.type = existing.adultMealId && existing.adultMealId !== mealId ? "split" : "family";
+      next.kidMealId = mealId;
+      if (!next.adultMealId) next.adultMealId = mealId;
+    }
+    if (next.adultMealId === next.kidMealId) next.type = "family";
+    dayPlan[slot] = next;
+    savePlans();
+    closeModal();
+    state.weekStart = wk;
+    state.view = "planner";
+    document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.view === "planner"));
+    render();
+    toast(`${meal.name} scheduled`);
+  };
 }
 
 // =============================================================================
@@ -527,9 +784,10 @@ function renderVaultGridOnly() {
 // =============================================================================
 function openSwap(day, slot, side) {
   state.swap = { day, slot, side };
-  const entry = state.plan[day][slot];
+  const plan = currentPlan();
+  const entry = (plan[day] && plan[day][slot]) || {};
   const currentId = side === "kid" ? entry.kidMealId : entry.adultMealId;
-  const currentMeal = getMeal(currentId);
+  const currentMeal = currentId ? getMeal(currentId) : null;
 
   const candidates = candidateMeals(slot, side, day, currentMeal);
 
@@ -538,12 +796,13 @@ function openSwap(day, slot, side) {
     `Swap ${side === "kid" ? "kid" : side === "adult" ? "adult" : "family"} ${slot} — ${DAY_FULL[day]}`;
 
   body.innerHTML = `
-    <p class="muted">Currently: <b>${currentMeal ? currentMeal.name : "—"}</b></p>
+    <p class="muted">Currently: <b>${currentMeal ? currentMeal.name : "— empty —"}</b></p>
     <p class="muted">Rules: no repeat protein within 2 days · no same meal at lunch & dinner same day · no same soup within 4 days${side==="kid" && slot==="lunch" && isSchoolDay(day) ? " · school = nut-free" : ""}</p>
     <div class="swap-list">
       ${candidates.map(({ meal, blocked, reason }) => `
         <div class="swap-option ${blocked ? "blocked" : ""}" data-id="${meal.id}">
-          <div>
+          <div class="swap-img">${meal.image || CATEGORY_EMOJI[meal.category] || "🍽"}</div>
+          <div style="flex:1">
             <div><b>${meal.name}</b></div>
             <div class="meta">${meal.category} · A ${meal.caloriesAdult} / K ${meal.caloriesKid} cal · ${meal.proteinType}</div>
             ${blocked ? `<div class="reason">${reason}</div>` : ""}
@@ -571,29 +830,25 @@ function candidateMeals(slot, side, day, currentMeal) {
     if (side === "kid") cats = isSchoolDay(day) ? ["kids-lunch"] : ["kids-lunch","lunch-adult","rice"];
     else if (side === "adult") cats = ["lunch-adult","rice"];
     else cats = ["rice","lunch-adult","protein"];
-  } else { // dinner
+  } else {
     cats = ["soup","rice","protein"];
   }
   const list = state.meals.filter(m => cats.includes(m.category));
+  const plan = currentPlan();
 
-  // Apply rules
   return list.map(meal => {
     if (currentMeal && meal.id === currentMeal.id) return { meal, blocked: true, reason: "Already planned here" };
 
-    // school nut-free rule
     if (side === "kid" && slot === "lunch" && isSchoolDay(day) && meal.nutAlert)
       return { meal, blocked: true, reason: "Contains nuts — not school-safe" };
 
-    // no same meal at lunch and dinner same day
-    const p = state.plan[day];
     const otherSlot = slot === "lunch" ? "dinner" : slot === "dinner" ? "lunch" : null;
     if (otherSlot) {
-      const other = p[otherSlot];
+      const other = plan[day] && plan[day][otherSlot];
       if (other && (other.adultMealId === meal.id || other.kidMealId === meal.id))
         return { meal, blocked: true, reason: "Same meal already scheduled the other part of the day" };
     }
 
-    // no repeat protein within 2 days (only if meal has a real protein)
     if (meal.proteinType && meal.proteinType !== "none" && meal.proteinType !== "mixed") {
       const dayIdx = DAYS.indexOf(day);
       for (let delta = -2; delta <= 2; delta++) {
@@ -601,12 +856,11 @@ function candidateMeals(slot, side, day, currentMeal) {
         const di = dayIdx + delta;
         if (di < 0 || di > 6) continue;
         const dayKey = DAYS[di];
-        const dp = state.plan[dayKey];
+        const dp = plan[dayKey] || {};
         for (const slotKey of ["breakfast","lunch","dinner"]) {
           const e = dp[slotKey];
           if (!e) continue;
-          const ids = [e.adultMealId, e.kidMealId];
-          for (const id of ids) {
+          for (const id of [e.adultMealId, e.kidMealId]) {
             const m = getMeal(id);
             if (m && m.proteinType === meal.proteinType)
               return { meal, blocked: true, reason: `${meal.proteinType} protein already on ${DAY_FULL[dayKey]}` };
@@ -615,7 +869,6 @@ function candidateMeals(slot, side, day, currentMeal) {
       }
     }
 
-    // no same soup within 4 days (only for soups, only when slotting into dinner)
     if (meal.category === "soup" && slot === "dinner") {
       const dayIdx = DAYS.indexOf(day);
       for (let delta = -4; delta <= 4; delta++) {
@@ -623,7 +876,7 @@ function candidateMeals(slot, side, day, currentMeal) {
         const di = dayIdx + delta;
         if (di < 0 || di > 6) continue;
         const dayKey = DAYS[di];
-        const dp = state.plan[dayKey];
+        const dp = plan[dayKey] || {};
         const e = dp.dinner;
         if (!e) continue;
         if (e.adultMealId === meal.id || e.kidMealId === meal.id)
@@ -637,18 +890,19 @@ function candidateMeals(slot, side, day, currentMeal) {
 
 function doSwap(newId) {
   const { day, slot, side } = state.swap;
-  const entry = state.plan[day][slot];
-  if (side === "family") {
-    entry.adultMealId = newId; entry.kidMealId = newId;
-  } else if (side === "kid") {
+  const plan = currentPlan();
+  const entry = (plan[day][slot] ||= { type: "family" });
+  if (side === "family") { entry.adultMealId = newId; entry.kidMealId = newId; entry.type = "family"; }
+  else if (side === "kid") {
     entry.kidMealId = newId;
-    // kid and adult may diverge → convert family → split if different
-    if (entry.type === "family" && entry.adultMealId !== newId) entry.type = "split";
+    if (entry.adultMealId !== newId) entry.type = "split";
+    else entry.type = "family";
   } else {
     entry.adultMealId = newId;
-    if (entry.type === "family" && entry.kidMealId !== newId) entry.type = "split";
+    if (entry.kidMealId !== newId) entry.type = "split";
+    else entry.type = "family";
   }
-  savePlan();
+  savePlans();
   closeSwap();
   render();
   toast("Meal swapped");
@@ -672,14 +926,24 @@ function openMealEditor(id) {
     id: "", name: "", category: "rice", cuisine: "mixed",
     caloriesAdult: 400, caloriesKid: 450, proteinType: "mixed",
     kidsFriendly: true, nutAlert: false, stephenFriendly: false,
-    stephenBenefits: [], prepTime: 30, notes: ""
+    stephenBenefits: [], prepTime: 30, notes: "",
+    image: "🍽", servings: 5, instructions: ""
   } : structuredClone(getMeal(id));
 
-  document.getElementById("modal-title").textContent = isNew ? "Add meal" : "Edit meal";
+  document.getElementById("modal-title").textContent = isNew ? "Add recipe" : "Edit recipe";
   const body = document.getElementById("modal-body");
   body.innerHTML = `
     <div class="form-grid">
-      <div class="full"><label>Name</label><input id="f-name" value="${escapeHtml(meal.name)}"></div>
+      <div class="full row" style="align-items:flex-end; gap:14px;">
+        <div style="flex:0 0 auto;">
+          <label>Photo (emoji)</label>
+          <input id="f-img" value="${escapeHtml(meal.image)}" maxlength="4" style="font-size:32px; width:80px; text-align:center;">
+        </div>
+        <div style="flex:1;">
+          <label>Name</label>
+          <input id="f-name" value="${escapeHtml(meal.name)}">
+        </div>
+      </div>
       <div><label>Category</label>
         <select id="f-cat">
           ${["soup","rice","swallow","protein","breakfast-adult","breakfast-kid","kids-lunch","lunch-adult"]
@@ -700,6 +964,8 @@ function openMealEditor(id) {
         </select>
       </div>
       <div><label>Prep time (min)</label><input id="f-prep" type="number" value="${meal.prepTime}"></div>
+      <div><label>Servings</label><input id="f-serv" type="number" value="${meal.servings}"></div>
+      <div></div>
       <div class="full checkrow">
         <label><input id="f-kids" type="checkbox" ${meal.kidsFriendly?"checked":""}> Kids-friendly</label>
         <label><input id="f-nut" type="checkbox" ${meal.nutAlert?"checked":""}> Contains nuts</label>
@@ -712,11 +978,14 @@ function openMealEditor(id) {
           ).join("")}
         </div>
       </div>
-      <div class="full"><label>Notes</label><textarea id="f-notes" rows="3">${escapeHtml(meal.notes||"")}</textarea></div>
+      <div class="full"><label>Notes</label><textarea id="f-notes" rows="2">${escapeHtml(meal.notes||"")}</textarea></div>
+      <div class="full"><label>Directions (one step per line)</label>
+        <textarea id="f-instructions" rows="6" placeholder="1. Step one&#10;2. Step two">${escapeHtml(meal.instructions||"")}</textarea>
+      </div>
     </div>
     <div class="modal-actions">
       <button id="f-cancel">Cancel</button>
-      <button id="f-save" class="primary">${isNew ? "Add meal" : "Save changes"}</button>
+      <button id="f-save" class="primary">${isNew ? "Add recipe" : "Save changes"}</button>
     </div>
   `;
   document.getElementById("modal").classList.remove("hidden");
@@ -728,6 +997,7 @@ function openMealEditor(id) {
     const m = {
       id: isNew ? slugify(name) + "-" + Date.now().toString(36) : meal.id,
       name,
+      image: document.getElementById("f-img").value || CATEGORY_EMOJI[document.getElementById("f-cat").value] || "🍽",
       category: document.getElementById("f-cat").value,
       cuisine:  document.getElementById("f-cuisine").value,
       caloriesAdult: +document.getElementById("f-ca").value || 0,
@@ -738,16 +1008,15 @@ function openMealEditor(id) {
       stephenFriendly:document.getElementById("f-steph").checked,
       stephenBenefits:[...document.querySelectorAll(".f-benefit:checked")].map(x => x.value),
       prepTime:      +document.getElementById("f-prep").value || 0,
+      servings:      +document.getElementById("f-serv").value || 5,
       notes:         document.getElementById("f-notes").value.trim(),
+      instructions:  document.getElementById("f-instructions").value.trim(),
     };
     if (isNew) state.meals.push(m);
-    else {
-      const idx = state.meals.findIndex(x => x.id === meal.id);
-      state.meals[idx] = m;
-    }
+    else state.meals[state.meals.findIndex(x => x.id === meal.id)] = m;
     saveMeals();
     closeModal();
-    toast(isNew ? "Meal added" : "Meal saved");
+    toast(isNew ? "Recipe added" : "Recipe saved");
     render();
   });
 }
@@ -762,12 +1031,17 @@ document.getElementById("modal").addEventListener("click", e => {
   if (e.target.id === "modal") closeModal();
 });
 
-// Initial URL view routing
-const initialView = new URLSearchParams(location.search).get("view");
+// =============================================================================
+// Initial routing
+// =============================================================================
+const params = new URLSearchParams(location.search);
+const initialView = params.get("view");
 if (initialView && ["planner","grocery","batch","vault"].includes(initialView)) {
   state.view = initialView;
   document.querySelectorAll("#tabs button").forEach(b =>
     b.classList.toggle("active", b.dataset.view === initialView));
 }
+const initialWeek = params.get("gw") || params.get("wk");
+if (initialWeek) state.weekStart = initialWeek;
 
 render();
