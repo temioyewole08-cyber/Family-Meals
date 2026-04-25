@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Family Meals — The Adeyemi Plan</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8D%B2%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+
+<header class="app-header">
+  <div class="brand">
+    <span class="logo">🍲</span>
+    <div>
+      <h1>Family Meals</h1>
+      <p class="sub">Temi · Stephen · 3 kids  ·  Calgary</p>
+    </div>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button data-view="planner" class="active">Weekly planner</button>
+    <button data-view="grocery">Grocery list</button>
+    <button data-view="batch">Batch cook</button>
+    <button data-view="vault">Meal vault</button>
+  </nav>
+</header>
+
+<main id="main"></main>
+
+<!-- Swap drawer -->
+<aside id="drawer" class="drawer hidden" aria-hidden="true">
+  <div class="drawer-inner">
+    <header>
+      <h2 id="drawer-title">Swap meal</h2>
+      <button class="icon-btn" id="drawer-close" aria-label="Close">✕</button>
+    </header>
+    <div class="drawer-body" id="drawer-body"></div>
+  </div>
+</aside>
+
+<!-- Vault edit modal -->
+<div id="modal" class="modal hidden" aria-hidden="true">
+  <div class="modal-inner">
+    <header>
+      <h2 id="modal-title">Edit meal</h2>
+      <button class="icon-btn" id="modal-close" aria-label="Close">✕</button>
+    </header>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
